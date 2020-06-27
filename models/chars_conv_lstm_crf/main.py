@@ -2,19 +2,18 @@
 
 __author__ = "Guillaume Genthial"
 
-import functools
+
 import json
 import logging
-from pathlib import Path
 import sys
+import os
+import shutil
 
-import numpy as np
-import tensorflow as tf
 from tf_metrics import precision, recall, f1
 
-from masked_conv import masked_conv1d_and_max
-
-DATADIR = '../../data/example'
+from models.chars_conv_lstm_crf.masked_conv import masked_conv1d_and_max
+from data.conll_input import *
+DATADIR = '~/.datasets/ner/CoNLL-2003/'
 
 # Logging
 Path('results').mkdir(exist_ok=True)
@@ -24,50 +23,6 @@ handlers = [
     logging.StreamHandler(sys.stdout)
 ]
 logging.getLogger('tensorflow').handlers = handlers
-
-
-def parse_fn(line_words, line_tags):
-    # Encode in Bytes for TF
-    words = [w.encode() for w in line_words.strip().split()]
-    tags = [t.encode() for t in line_tags.strip().split()]
-    assert len(words) == len(tags), "Words and tags lengths don't match"
-
-    # Chars
-    chars = [[c.encode() for c in w] for w in line_words.strip().split()]
-    lengths = [len(c) for c in chars]
-    max_len = max(lengths)
-    chars = [c + [b'<pad>'] * (max_len - l) for c, l in zip(chars, lengths)]
-    return ((words, len(words)), (chars, lengths)), tags
-
-
-def generator_fn(words, tags):
-    with Path(words).open('r') as f_words, Path(tags).open('r') as f_tags:
-        for line_words, line_tags in zip(f_words, f_tags):
-            yield parse_fn(line_words, line_tags)
-
-
-def input_fn(words, tags, params=None, shuffle_and_repeat=False):
-    params = params if params is not None else {}
-    shapes = ((([None], ()),               # (words, nwords)
-               ([None, None], [None])),    # (chars, nchars)
-              [None])                      # tags
-    types = (((tf.string, tf.int32),
-              (tf.string, tf.int32)),
-             tf.string)
-    defaults = ((('<pad>', 0),
-                 ('<pad>', 0)),
-                'O')
-    dataset = tf.data.Dataset.from_generator(
-        functools.partial(generator_fn, words, tags),
-        output_shapes=shapes, output_types=types)
-
-    if shuffle_and_repeat:
-        dataset = dataset.shuffle(params['buffer']).repeat(params['epochs'])
-
-    dataset = (dataset
-               .padded_batch(params.get('batch_size', 20), shapes, defaults)
-               .prefetch(1))
-    return dataset
 
 
 def model_fn(features, labels, mode, params):
@@ -173,39 +128,57 @@ def model_fn(features, labels, mode, params):
 if __name__ == '__main__':
     # Params
     params = {
-        'dim_chars': 100,
-        'dim': 300,
-        'dropout': 0.5,
-        'num_oov_buckets': 1,
-        'epochs': 25,
-        'batch_size': 20,
-        'buffer': 15000,
         'filters': 50,
         'kernel_size': 3,
+        'dim_chars': 100,
+
+        'dim': 300,
+        'dropout': 0.5,
+        'num_oov_buckets': 1, # ？
+        'epochs': 25,
+        'batch_size': 20,
+        'buffer': 15000, # ？
         'lstm_size': 100,
-        'words': str(Path(DATADIR, 'vocab.words.txt')),
-        'chars': str(Path(DATADIR, 'vocab.chars.txt')),
-        'tags': str(Path(DATADIR, 'vocab.tags.txt')),
-        'glove': str(Path(DATADIR, 'glove.npz'))
+        'force_build_vocab': False,
+        'vocab_dir': './',
+        'force_build_glove': False,
+        'glove': './glove.npz',
+        'pretrain_glove': '~/.datasets/embeddings/glove.840B.300d/glove.840B.300d.txt',
+        'files': [
+            '~/.datasets/ner/CoNLL-2003/train.txt',
+            '~/.datasets/ner/CoNLL-2003/dev.txt',
+            '~/.datasets/ner/CoNLL-2003/test.txt'
+        ]
     }
     with Path('results/params.json').open('w') as f:
         json.dump(params, f, indent=4, sort_keys=True)
 
-    def fwords(name):
-        return str(Path(DATADIR, '{}.words.txt'.format(name)))
+    def fname(name):
+        return str(Path(DATADIR, '{}.txt'.format(name)).expanduser())
 
-    def ftags(name):
-        return str(Path(DATADIR, '{}.tags.txt'.format(name)))
+    params['words'], params['chars'], params['tags'] = build_vocab(params['files'],
+            params['vocab_dir'],
+            force_build=params['force_build_vocab']
+    )
+
+    params['glove'] = build_glove(words_file=params['words'],
+        output_path=params['glove'],
+        glove_path=params['pretrain_glove'],
+        force_build=params['force_build_glove']
+    )
 
     # Estimator, train and evaluate
-    train_inpf = functools.partial(input_fn, fwords('train'), ftags('train'),
-                                   params, shuffle_and_repeat=True)
-    eval_inpf = functools.partial(input_fn, fwords('testa'), ftags('testa'))
+    train_inpf = functools.partial(input_fn, fname('train'), params, shuffle_and_repeat=True, with_char=True)
+    eval_inpf = functools.partial(input_fn, fname('dev'), with_char=True)
 
     cfg = tf.estimator.RunConfig(save_checkpoints_secs=120)
-    estimator = tf.estimator.Estimator(model_fn, 'results/model', cfg, params)
+    model_path = 'results/model'
+    if os.path.exists(model_path):
+        shutil.rmtree(model_path)
+
+    estimator = tf.estimator.Estimator(model_fn, model_path, cfg, params)
     Path(estimator.eval_dir()).mkdir(parents=True, exist_ok=True)
-    hook = tf.contrib.estimator.stop_if_no_increase_hook(
+    hook = tf.estimator.experimental.stop_if_no_decrease_hook(
         estimator, 'f1', 500, min_steps=8000, run_every_secs=120)
     train_spec = tf.estimator.TrainSpec(input_fn=train_inpf, hooks=[hook])
     eval_spec = tf.estimator.EvalSpec(input_fn=eval_inpf, throttle_secs=120)
@@ -215,11 +188,11 @@ if __name__ == '__main__':
     def write_predictions(name):
         Path('results/score').mkdir(parents=True, exist_ok=True)
         with Path('results/score/{}.preds.txt'.format(name)).open('wb') as f:
-            test_inpf = functools.partial(input_fn, fwords(name), ftags(name))
-            golds_gen = generator_fn(fwords(name), ftags(name))
+            test_inpf = functools.partial(input_fn, fname(name))
+            golds_gen = generator_fn(fname(name))
             preds_gen = estimator.predict(test_inpf)
             for golds, preds in zip(golds_gen, preds_gen):
-                ((words, _), (_, _)), tags = golds
+                ((words, _), tags) = golds
                 for word, tag, tag_pred in zip(words, tags, preds['tags']):
                     f.write(b' '.join([word, tag, tag_pred]) + b'\n')
                 f.write(b'\n')

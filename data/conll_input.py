@@ -5,35 +5,68 @@ import functools
 from collections import Counter
 import numpy as np
 
-def parse_fn(lines, encode=True):
+MINCOUNT = 1
+
+def parse_fn(lines, encode=True, with_char=False):
     # Encode in Bytes for TF
-    words, tags = [], []
+    words, tags, chars = [], [], []
     for line in lines:
         segs = line.strip().split()
         words.append(segs[0].encode() if encode else segs[0])
+        chars.append([c.encode() for c in segs[0]])
         tags.append(segs[-1].encode() if encode else segs[-1])
     assert len(words) == len(tags), "Words and tags lengths don't match"
-    return (words, len(words)), tags
+    if not with_char:
+        return (words, len(words)), tags
+    else:
+        # Chars
+        lengths = [len(c) for c in chars]
+        max_len = max(lengths)
+        chars = [c + [b'<pad>'] * (max_len - l) for c, l in zip(chars, lengths)]
+        return ((words, len(words)), (chars, lengths)), tags
 
-def generator_fn(fname, encode=True):
+def generator_fn(fname, encode=True, with_char=False):
     with Path(fname).expanduser().open('r') as fid:
         lines = []
         for _line in fid:
             _line = _line.strip()
             if not _line:
-                yield parse_fn(lines, encode=encode)
+                yield parse_fn(lines, encode=encode, with_char=with_char)
                 del lines[:]
             else:
                 lines.append(_line)
 
-def input_fn(file, params=None, shuffle_and_repeat=False):
+def input_fn(file, params=None, shuffle_and_repeat=False, with_char=False):
     params = params if params is not None else {}
-    shapes = (([None], ()), [None])
-    types = ((tf.string, tf.int32), tf.string)
-    defaults = (('<pad>', 0), 'O')
+    if not with_char:
+        shapes = (([None], ()), [None])
+        types = ((tf.string, tf.int32), tf.string)
+        defaults = (('<pad>', 0), 'O')
+    else:
+        shapes = (
+            (
+                ([None], ()),  # (words, nwords)
+                ([None, None], [None])
+            ),  # (chars, nchars)
+            [None]
+        )  # tags
+        types = (
+            (
+                (tf.string, tf.int32),
+                (tf.string, tf.int32)
+            ),
+            tf.string
+        )
+        defaults = (
+            (
+                ('<pad>', 0),
+                ('<pad>', 0)
+            ),
+            'O'
+        )
 
     dataset = tf.data.Dataset.from_generator(
-        functools.partial(generator_fn, file),
+        functools.partial(generator_fn, file, with_char=with_char),
         output_shapes=shapes, output_types=types)
 
     if shuffle_and_repeat:
@@ -43,8 +76,6 @@ def input_fn(file, params=None, shuffle_and_repeat=False):
                .padded_batch(params.get('batch_size', 20), shapes, defaults)
                .prefetch(1))
     return dataset
-
-MINCOUNT = 1
 
 def build_vocab(files, output_dir, min_count=MINCOUNT, force_build=False, encode=False):
     # 1. Words
