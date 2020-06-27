@@ -1,0 +1,8 @@
+
+__pycache__
+*.npz
+results
+models/*/vocab.*.txt
+models/*/vocab.*.txt
+models/*/vocab.*.txt
+glove.840B.300d.txt
