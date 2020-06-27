@@ -21,7 +21,6 @@ __Training time__ ~ 35 min
 |abs. best |  | | 91.42 |  |
 |abs. best (EMA) |   | | 91.22 |  |
 
-
 ## 1. Format your data to the right format
 
 Follow the [`data/example`](https://github.com/guillaumegenthial/tf_ner/tree/master/data/example) and add your data to `data/your_data` for instance.

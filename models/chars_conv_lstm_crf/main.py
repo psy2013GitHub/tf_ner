@@ -188,14 +188,14 @@ if __name__ == '__main__':
     def write_predictions(name):
         Path('results/score').mkdir(parents=True, exist_ok=True)
         with Path('results/score/{}.preds.txt'.format(name)).open('wb') as f:
-            test_inpf = functools.partial(input_fn, fname(name))
-            golds_gen = generator_fn(fname(name))
+            test_inpf = functools.partial(input_fn, fname(name), with_char=True)
+            golds_gen = generator_fn(fname(name), with_char=True)
             preds_gen = estimator.predict(test_inpf)
             for golds, preds in zip(golds_gen, preds_gen):
-                ((words, _), tags) = golds
+                ((words, _), (_, _)), tags = golds
                 for word, tag, tag_pred in zip(words, tags, preds['tags']):
                     f.write(b' '.join([word, tag, tag_pred]) + b'\n')
                 f.write(b'\n')
 
-    for name in ['train', 'testa', 'testb']:
+    for name in ['train', 'dev', 'test']:
         write_predictions(name)
