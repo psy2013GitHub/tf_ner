@@ -2,6 +2,10 @@
 
 __author__ = "Guillaume Genthial"
 
+'''
+    将title和text拼接后，直接使用lstm_crf建模
+'''
+
 import json
 import logging
 import sys
@@ -11,14 +15,15 @@ import shutil
 from tf_metrics import precision, recall, f1
 from models.common.embedding_layer import embedding_layer
 
-from data.conll_input import *
-DATADIR = '~/.datasets/ner/CoNLL-2003/'
+from data.ner_datafountain_361 import *
+DATADIR = '~/.datasets/ner/datafoundation_361/'
+RESULT_PATH = './results_v1/'
 
 # Logging
-Path('results').mkdir(exist_ok=True)
+Path(RESULT_PATH).mkdir(exist_ok=True)
 tf.logging.set_verbosity(logging.INFO)
 handlers = [
-    logging.FileHandler('results/main.log'),
+    logging.FileHandler('{}/main.log'.format(RESULT_PATH)),
     logging.StreamHandler(sys.stdout)
 ]
 logging.getLogger('tensorflow').handlers = handlers
@@ -118,27 +123,25 @@ if __name__ == '__main__':
         'dim': 300,
         'dropout': 0.5,
         'num_oov_buckets': 1, # ？
-        'epochs': 25,
+        'epochs': 50,
         'batch_size': 20,
         'buffer': 15000, # ？
         'lstm_size': 100,
-        'force_build_vocab': False,
-        'vocab_dir': './',
+        'force_build_vocab': True,
+        'vocab_dir': '{}/'.format(RESULT_PATH),
         'rand_embedding': True, # 随机初始化embedding
         'force_build_glove': False,
-        'glove': './glove.npz',
+        'glove': '{}/glove.npz'.format(RESULT_PATH),
         'pretrain_glove': '~/.datasets/embeddings/glove.840B.300d/glove.840B.300d.txt',
         'files': [
-            '~/.datasets/ner/CoNLL-2003/train.txt',
-            '~/.datasets/ner/CoNLL-2003/dev.txt',
-            '~/.datasets/ner/CoNLL-2003/test.txt'
+            '{}/train.csv'.format(DATADIR)
         ]
     }
-    with Path('results/params.json').open('w') as f:
+    with Path('{}/params.json'.format(RESULT_PATH)).open('w') as f:
         json.dump(params, f, indent=4, sort_keys=True)
 
     def fname(name):
-        return str(Path(DATADIR, '{}.txt'.format(name)).expanduser())
+        return str(Path('{}/tmp.{}.csv'.format(RESULT_PATH, name)).expanduser())
 
     params['words'], params['chars'], params['tags'] = build_vocab(params['files'],
             params['vocab_dir'],
@@ -152,11 +155,14 @@ if __name__ == '__main__':
     )
 
     # Estimator, train and evaluate
-    train_inpf = functools.partial(input_fn, fname('train'), params, shuffle_and_repeat=True)
-    eval_inpf = functools.partial(input_fn, fname('dev'))
+    train_idx, valid_idx = split_train_file('{}/train.csv'.format(DATADIR), seed=123, train_count=(4000//params['batch_size']+1)*params['batch_size'],
+           flush_to_file=True, train_out_path=fname('train'), valid_out_path=fname('valid'))
+
+    train_inpf = functools.partial(input_fn, fname('train'), params, shuffle_and_repeat=True, mode=None)
+    eval_inpf = functools.partial(input_fn, fname('valid'), mode=None)
 
     cfg = tf.estimator.RunConfig(save_checkpoints_secs=120)
-    model_path = 'results/model'
+    model_path = '{}/model'.format(RESULT_PATH)
     if os.path.exists(model_path):
         shutil.rmtree(model_path)
     estimator = tf.estimator.Estimator(model_fn, model_path, cfg, params)
@@ -169,9 +175,9 @@ if __name__ == '__main__':
 
     # Write predictions to file
     def write_predictions(name):
-        Path('results/score').mkdir(parents=True, exist_ok=True)
-        with Path('results/score/{}.preds.txt'.format(name)).open('wb') as f:
-            test_inpf = functools.partial(input_fn, fname(name))
+        Path('{}/score'.format(RESULT_PATH)).mkdir(parents=True, exist_ok=True)
+        with Path('{}/score/{}.preds.txt'.format(RESULT_PATH, name)).open('wb') as f:
+            test_inpf = functools.partial(input_fn, fname(name), mode=None)
             golds_gen = generator_fn(fname(name))
             preds_gen = estimator.predict(test_inpf)
             for golds, preds in zip(golds_gen, preds_gen):

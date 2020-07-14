@@ -1,8 +1,9 @@
 .idea
 __pycache__
 *.npz
-results
+results*
 models/*/vocab.*.txt
 models/*/vocab.*.txt
 models/*/vocab.*.txt
 glove.840B.300d.txt
+*log

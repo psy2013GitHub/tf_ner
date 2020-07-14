@@ -1,72 +1,126 @@
 
+import os
+import random
+import sys
 from pathlib import Path
 import tensorflow as tf
 import functools
 from collections import Counter
 import numpy as np
+from .bert_formatter import convert_single_instance
 
 MINCOUNT = 1
 
-def parse_fn(lines, encode=True, with_char=False):
+def parse_fn(lines, encode=True, with_char=False, bert_out=False, bert_proj_path=None, bert_config_json=None, max_seq_len=512):
     # Encode in Bytes for TF
     words, tags, chars = [], [], []
     for line in lines:
         segs = line.strip().split()
-        words.append(segs[0].encode() if encode else segs[0])
+        words.append(segs[0].encode() if encode and not bert_out else segs[0])
         chars.append([c.encode() for c in segs[0]])
-        tags.append(segs[-1].encode() if encode else segs[-1])
+        tags.append(segs[-1].encode() if encode and not bert_out else segs[-1])
     assert len(words) == len(tags), "Words and tags lengths don't match"
+
+    n_words = len(words)
+    if bert_out:
+        assert bert_proj_path, 'bert_proj_path must not be None'
+        sys.path.append(os.path.expanduser(bert_proj_path))
+        from models.bert.tokenization import FullTokenizer
+        tokenizer = FullTokenizer(vocab_file=bert_config_json['vocab_file'], do_lower_case=bert_config_json['do_lower_case'])
+        input_ids, input_mask, segment_ids, tags, n_words = convert_single_instance(words, tags, max_seq_len, tokenizer)
+        words = input_ids, input_mask, segment_ids
+
+        # if random.randint(0, 100) < 5:
+        #     print("\nwords: %s" % " ".join([str(x) for x in words]))
+        #     print("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+        #     print("input_mask: %s" % " ".join([str(x) for x in input_mask]))
+        #     print("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+        #     print("label: %s" % " ".join([str(x) for x in tags]))
+        #     print("n_words: %s\n" % n_words)
+
+    tags = [_.encode() if encode else _ for _ in tags]
     if not with_char:
-        return (words, len(words)), tags
+        return (words, n_words), tags
     else:
         # Chars
         lengths = [len(c) for c in chars]
         max_len = max(lengths)
         chars = [c + [b'<pad>'] * (max_len - l) for c, l in zip(chars, lengths)]
-        return ((words, len(words)), (chars, lengths)), tags
+        return ((words, n_words), (chars, lengths)), tags
 
-def generator_fn(fname, encode=True, with_char=False):
+def generator_fn(fname, encode=True, with_char=False, bert_out=False, bert_proj_path=None, bert_config_json=None, max_seq_len=512):
     with Path(fname).expanduser().open('r') as fid:
         lines = []
         for _line in fid:
             _line = _line.strip()
             if not _line:
-                yield parse_fn(lines, encode=encode, with_char=with_char)
+                yield parse_fn(lines, encode=encode, with_char=with_char,
+                               bert_out=bert_out, bert_proj_path=bert_proj_path, bert_config_json=bert_config_json, max_seq_len=max_seq_len)
                 del lines[:]
             else:
                 lines.append(_line)
 
-def input_fn(file, params=None, shuffle_and_repeat=False, with_char=False):
+def input_fn(file, params=None, shuffle_and_repeat=False, with_char=False, bert_out=False,
+             bert_proj_path=None, bert_config_json=None, max_seq_len=512):
     params = params if params is not None else {}
-    if not with_char:
-        shapes = (([None], ()), [None])
-        types = ((tf.string, tf.int32), tf.string)
-        defaults = (('<pad>', 0), 'O')
+    if bert_out:
+        if not with_char:
+            shapes = ((([None], [None], [None]), ()), [None])
+            types = (((tf.int32, tf.int32, tf.int32), tf.int32), tf.string)
+            defaults = (((0, 0, 0), 0), 'O')
+        else:
+            shapes = (
+                (
+                    (([None], [None], [None]), ()),
+                    ([None, None], [None])
+                ),  # (chars, nchars)
+                [None]
+            )  # tags
+            types = (
+                (
+                    ((tf.int32, tf.int32, tf.int32), tf.int32),
+                    (tf.string, tf.int32)
+                ),
+                tf.string
+            )
+            defaults = (
+                (
+                    ((0, 0, 0), 0),
+                    ('<pad>', 0)
+                ),
+                'O'
+            )
     else:
-        shapes = (
-            (
-                ([None], ()),  # (words, nwords)
-                ([None, None], [None])
-            ),  # (chars, nchars)
-            [None]
-        )  # tags
-        types = (
-            (
-                (tf.string, tf.int32),
-                (tf.string, tf.int32)
-            ),
-            tf.string
-        )
-        defaults = (
-            (
-                ('<pad>', 0),
-                ('<pad>', 0)
-            ),
-            'O'
-        )
+        if not with_char:
+            shapes = (([None], ()), [None])
+            types = ((tf.string, tf.int32), tf.string)
+            defaults = (('<pad>', 0), 'O')
+        else:
+            shapes = (
+                (
+                    ([None], ()),  # (words, nwords)
+                    ([None, None], [None])
+                ),  # (chars, nchars)
+                [None]
+            )  # tags
+            types = (
+                (
+                    (tf.string, tf.int32),
+                    (tf.string, tf.int32)
+                ),
+                tf.string
+            )
+            defaults = (
+                (
+                    ('<pad>', 0),
+                    ('<pad>', 0)
+                ),
+                'O'
+            )
 
     dataset = tf.data.Dataset.from_generator(
-        functools.partial(generator_fn, file, with_char=with_char),
+        functools.partial(generator_fn, file, with_char=with_char, bert_out=bert_out,
+                          bert_proj_path=bert_proj_path, bert_config_json=bert_config_json, max_seq_len=max_seq_len),
         output_shapes=shapes, output_types=types)
 
     if shuffle_and_repeat:

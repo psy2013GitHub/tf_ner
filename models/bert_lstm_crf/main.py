@@ -4,15 +4,12 @@ __author__ = "Guillaume Genthial"
 
 import json
 import logging
-import sys
 import os
 import shutil
 
 from tf_metrics import precision, recall, f1
-from models.common.embedding_layer import embedding_layer
 
 from data.conll_input import *
-DATADIR = '~/.datasets/ner/CoNLL-2003/'
 
 # Logging
 Path('results').mkdir(exist_ok=True)
@@ -31,30 +28,40 @@ def model_fn(features, labels, mode, params):
 
     # Read vocabs and inputs
     dropout = params['dropout']
-    words, nwords = features
+    (input_ids, input_mask, segment_ids), nwords = features
     training = (mode == tf.estimator.ModeKeys.TRAIN)
 
     # 将词转化为int
-    vocab_words = tf.contrib.lookup.index_table_from_file(
-        params['words'], num_oov_buckets=params['num_oov_buckets'])
     with Path(params['tags']).open() as f:
         indices = [idx for idx, tag in enumerate(f) if tag.strip() != 'O']
         num_tags = len(indices) + 1
 
-    with Path(params['words']).open() as f:
-        words_vocab_size = len(f.readlines()) + params['num_oov_buckets']
+    # Bert Embeddings
+    sys.path.append(params['bert_project_path'])
+    from models.bert import modeling
+    bert_config = modeling.BertConfig.from_json_file(params['bert_config_file'])
+    bert_model = modeling.BertModel(
+        config=bert_config,
+        is_training=training,
+        input_ids=input_ids,
+        input_mask=input_mask,
+        token_type_ids=segment_ids,
+        use_one_hot_embeddings=False
+    )
+    tvars = tf.trainable_variables()
+    # 加载BERT模型
+    if params.get('bert_init_checkpoint', False):
+        init_checkpoint = params['bert_init_checkpoint']
+        (assignment_map, initialized_variable_names) = \
+            modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
-    # Word Embeddings
-    word_ids = vocab_words.lookup(words)
-    if params.get('rand_embedding', False):
-        print('\n\nrand embedding\n')
-        embeddings = embedding_layer(word_ids, words_vocab_size, params['dim'], zero_pad=False)
-    else:
-        glove = np.load(str(Path(params['glove']).expanduser()))['embeddings']  # np.array
-        variable = np.vstack([glove, [[0.]*params['dim']]])
-        variable = tf.Variable(variable, dtype=tf.float32, trainable=False)
-        embeddings = tf.nn.embedding_lookup(variable, word_ids)
-    embeddings = tf.layers.dropout(embeddings, rate=dropout, training=training)
+    # 获取对应的embedding 输入数据[batch_size, seq_length, embedding_size]
+    embeddings = bert_model.get_sequence_output()
+    max_seq_length = embeddings.shape[1].value
+
+    # dropout
+    embeddings = tf.layers.dropout(embeddings, rate=0.1, training=training)
 
     # LSTM
     t = tf.transpose(embeddings, perm=[1, 0, 2])
@@ -91,7 +98,8 @@ def model_fn(features, labels, mode, params):
         loss = tf.reduce_mean(-log_likelihood)
 
         # Metrics
-        weights = tf.sequence_mask(nwords)
+        weights = input_mask
+        # weights = tf.sequence_mask(nwords, maxlen=max_seq_length)
         metrics = {
             'acc': tf.metrics.accuracy(tags, pred_ids, weights),
             'precision': precision(tags, pred_ids, num_tags, indices, weights),
@@ -106,7 +114,7 @@ def model_fn(features, labels, mode, params):
                 mode, loss=loss, eval_metric_ops=metrics)
 
         elif mode == tf.estimator.ModeKeys.TRAIN:
-            train_op = tf.train.AdamOptimizer().minimize(
+            train_op = tf.train.AdamOptimizer(learning_rate=params['learning_rate']).minimize(
                 loss, global_step=tf.train.get_or_create_global_step())
             return tf.estimator.EstimatorSpec(
                 mode, loss=loss, train_op=train_op)
@@ -115,13 +123,15 @@ def model_fn(features, labels, mode, params):
 if __name__ == '__main__':
     # Params
     params = {
+        'max_seq_len': 50,
+        'learning_rate': 1e-5,
         'dim': 300,
         'dropout': 0.5,
         'num_oov_buckets': 1, # ？
         'epochs': 25,
-        'batch_size': 20,
-        'buffer': 15000, # ？
-        'lstm_size': 100,
+        'batch_size': 8,
+        'buffer': 1500, # ？
+        'lstm_size': 768,
         'force_build_vocab': False,
         'vocab_dir': './',
         'rand_embedding': True, # 随机初始化embedding
@@ -132,13 +142,26 @@ if __name__ == '__main__':
             '~/.datasets/ner/CoNLL-2003/train.txt',
             '~/.datasets/ner/CoNLL-2003/dev.txt',
             '~/.datasets/ner/CoNLL-2003/test.txt'
-        ]
+        ],
+        'bert_project_path': '~/Documents/bert/',
+        'bert_init_checkpoint': '/data/models/bert/cased_L-12_H-768_A-12/bert_model.ckpt',
+        'bert_config_file': '/data/models/bert/cased_L-12_H-768_A-12/bert_config.json',
+        'bert_config': {
+            'vocab_file': '/data/models/bert/cased_L-12_H-768_A-12/vocab.txt',
+            'do_lower_case': False
+        },
+        'RESULT_PATH': './results_v2/',
+        'DATADIR': '~/.datasets/ner/CoNLL-2003/'
     }
-    with Path('results/params.json').open('w') as f:
+
+    if not os.path.exists(params['RESULT_PATH']):
+        os.mkdir(params['RESULT_PATH'])
+
+    with Path('{}/params.json'.format(params['RESULT_PATH'])).open('w') as f:
         json.dump(params, f, indent=4, sort_keys=True)
 
     def fname(name):
-        return str(Path(DATADIR, '{}.txt'.format(name)).expanduser())
+        return str(Path('{}/{}.txt'.format(params['DATADIR'], name)).expanduser())
 
     params['words'], params['chars'], params['tags'] = build_vocab(params['files'],
             params['vocab_dir'],
@@ -152,11 +175,21 @@ if __name__ == '__main__':
     )
 
     # Estimator, train and evaluate
-    train_inpf = functools.partial(input_fn, fname('train'), params, shuffle_and_repeat=True)
-    eval_inpf = functools.partial(input_fn, fname('dev'))
+    train_inpf = functools.partial(input_fn, fname('train'), params, shuffle_and_repeat=True,
+                bert_out=True, bert_proj_path=params.get('bert_project_path', None),
+                bert_config_json=params.get('bert_config', None), max_seq_len=params.get('max_seq_len', None))
+    eval_inpf = functools.partial(input_fn, fname('dev'),
+                bert_out=True, bert_proj_path=params.get('bert_project_path', None),
+                bert_config_json=params.get('bert_config', None), max_seq_len=params.get('max_seq_len', None))
 
-    cfg = tf.estimator.RunConfig(save_checkpoints_secs=120)
-    model_path = 'results/model'
+    session_config = tf.ConfigProto(
+        log_device_placement=False,
+        inter_op_parallelism_threads=0,
+        intra_op_parallelism_threads=0,
+        allow_soft_placement=True)
+
+    cfg = tf.estimator.RunConfig(save_checkpoints_secs=120, session_config=session_config)
+    model_path = '{}/model'.format(params['RESULT_PATH'])
     if os.path.exists(model_path):
         shutil.rmtree(model_path)
     estimator = tf.estimator.Estimator(model_fn, model_path, cfg, params)
@@ -169,15 +202,26 @@ if __name__ == '__main__':
 
     # Write predictions to file
     def write_predictions(name):
-        Path('results/score').mkdir(parents=True, exist_ok=True)
-        with Path('results/score/{}.preds.txt'.format(name)).open('wb') as f:
-            test_inpf = functools.partial(input_fn, fname(name))
-            golds_gen = generator_fn(fname(name))
+        Path('{}/score'.format(params['RESULT_PATH'])).mkdir(parents=True, exist_ok=True)
+        with Path('{}/score/{}.preds.txt'.format(params['RESULT_PATH'], name)).open('wb') as f:
+            test_inpf = functools.partial(input_fn, fname(name),
+                bert_out=True, bert_proj_path=params.get('bert_project_path', None),
+                bert_config_json=params.get('bert_config', None), max_seq_len=params.get('max_seq_len', None))
+            golds_gen = generator_fn(fname(name),
+                bert_out=True, bert_proj_path=params.get('bert_project_path', None),
+                bert_config_json=params.get('bert_config', None), max_seq_len=params.get('max_seq_len', None))
             preds_gen = estimator.predict(test_inpf)
             for golds, preds in zip(golds_gen, preds_gen):
-                ((words, _), tags) = golds
-                for word, tag, tag_pred in zip(words, tags, preds['tags']):
-                    f.write(b' '.join([word, tag, tag_pred]) + b'\n')
+                ((input_ids, input_mask, segment_ids), nwords), tags = golds
+                word_count = 1
+                for word, tag, tag_pred in zip(input_ids, tags, preds['tags']):
+                    word_count += 1
+                    if word_count > nwords:
+                        break
+                    if word_count == 1 or word_count == nwords: # 去掉CLS和SEP
+                        continue
+
+                    f.write(b' '.join([str(word).encode(), tag, tag_pred]) + b'\n')
                 f.write(b'\n')
 
     for name in ['train', 'dev', 'test']:
